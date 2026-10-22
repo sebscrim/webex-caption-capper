@@ -1,0 +1,657 @@
+(async () => {
+    // How often to read new captions, and how often to download the
+    // latest transcript (only if it changed since the last download).
+    const CHECK_EVERY_MS = 2000;
+    const DOWNLOAD_EVERY_MS = 5 * 60 * 1000;
+
+    // If the panel isn't scrolled to the bottom, Webex doesn't render new
+    // captions, so scroll through and catch up at most this often.
+    const FULL_SYNC_EVERY_MS = 60 * 1000;
+
+    /*
+     * The full transcript is kept in localStorage so every run can merge
+     * what Webex currently shows into it and save one complete file, even
+     * after Webex drops old captions or the page is reloaded. A meeting
+     * not updated for SESSION_GAP_MS is treated as a new session.
+     */
+    const STORAGE_PREFIX = "webex-caption-capper:";
+    const SESSION_GAP_MS = 6 * 60 * 60 * 1000;
+    const GAP_MARKER = "[... some captions may be missing here ...]";
+
+    // Stop a copy of this script that is already running in this tab.
+    window.webexCaptionCapper?.stop({ download: false });
+
+    const meetingName =
+        document.title
+            .replace(/\b(cisco\s+)?webex(\s+meetings?)?\b/gi, "")
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-")
+            .replace(/^-+|-+$/g, "") || "meeting";
+
+    const STORAGE_KEY = STORAGE_PREFIX + meetingName;
+
+    let session = null;
+
+    try {
+        session = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    } catch {}
+
+    if (!session || Date.now() - session.updated > SESSION_GAP_MS) {
+        session = { captions: [], updated: Date.now() };
+    }
+
+    session.meeting = meetingName;
+
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+    // Search through normal DOM + open shadow roots.
+    function deepQueryAll(selector, root = document) {
+        const results = [];
+
+        function search(currentRoot) {
+            let elements;
+
+            try {
+                elements = currentRoot.querySelectorAll("*");
+            } catch {
+                return;
+            }
+
+            try {
+                results.push(...currentRoot.querySelectorAll(selector));
+            } catch {}
+
+            for (const el of elements) {
+                if (el.shadowRoot) {
+                    search(el.shadowRoot);
+                }
+            }
+        }
+
+        search(root);
+        return results;
+    }
+
+    function deepFind(selector, root = document) {
+        return deepQueryAll(selector, root)[0] || null;
+    }
+
+    function getText(node) {
+        try {
+            const text = node.innerText?.trim();
+            if (text) return text;
+        } catch {}
+
+        try {
+            return node.textContent
+                ?.replace(/\s+/g, " ")
+                .trim() || "";
+        } catch {
+            return "";
+        }
+    }
+
+    const norm = s => s.replace(/\s+/g, " ").trim();
+
+    // Same caption, allowing for one copy still being spoken mid-sentence.
+    const sameCaption = (a, b) =>
+        a === b || a.startsWith(b) || b.startsWith(a);
+
+    const realCount = entries => entries.filter(t => t !== GAP_MARKER).length;
+
+    function filenameNow(name = meetingName) {
+        // webex-captions-<meetingname>-<date>-<time>.txt, stamped with now.
+        const now = new Date();
+        const pad = n => String(n).padStart(2, "0");
+        const date =
+            `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+        const time = `${pad(now.getHours())}${pad(now.getMinutes())}`;
+
+        return `webex-captions-${name}-${date}-${time}.txt`;
+    }
+
+    function download(entries, filename) {
+        const blob = new Blob(
+            [entries.join("\n\n")],
+            { type: "text/plain;charset=utf-8" }
+        );
+
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+
+        a.href = url;
+        a.download = filename;
+
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+    }
+
+    const CAPTIONS_SELECTOR = 'mdc-list[aria-label="Captions"]';
+    const BOX_SELECTOR = '[data-test^="transcript-box-"]';
+
+    // Webex caption list.
+    let list = deepFind(CAPTIONS_SELECTOR);
+
+    if (!list) {
+        // The meeting usually lives in a cross-origin iframe, which a script
+        // pasted into the outer page is not allowed to read.
+        const inOuterPage = [...document.querySelectorAll("iframe")].some(
+            frame => /web\.webex\.com/.test(frame.src)
+        );
+
+        if (inOuterPage) {
+            alert(
+                "Could not find the Webex captions panel.\n\n" +
+                "The console is running in the outer page, not the meeting " +
+                "frame. Right-click any caption and choose Inspect, then " +
+                "paste and run this again in the Console. (Or pick " +
+                "web.webex.com/meeting in the Console's context dropdown.)"
+            );
+            return;
+        }
+
+        // The meeting may have ended: offer the most recent saved transcript.
+        let latest = null;
+
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+
+            if (!key?.startsWith(STORAGE_PREFIX)) continue;
+
+            try {
+                const saved = JSON.parse(localStorage.getItem(key));
+
+                if (saved?.captions?.length && (!latest || saved.updated > latest.updated)) {
+                    latest = saved;
+                }
+            } catch {}
+        }
+
+        if (
+            latest &&
+            confirm(
+                "Could not find the Webex captions panel " +
+                "(the meeting may have ended).\n\n" +
+                `Download the saved transcript (${realCount(latest.captions)} ` +
+                `caption entries, last updated ` +
+                `${new Date(latest.updated).toLocaleTimeString()})?`
+            )
+        ) {
+            download(latest.captions, filenameNow(latest.meeting || meetingName));
+            return;
+        }
+
+        if (!latest) {
+            alert(
+                "Could not find the Webex captions panel.\n\n" +
+                "Make sure the Captions panel is open, then run this again."
+            );
+        }
+        return;
+    }
+
+    console.log("Found Webex caption list:", list);
+
+    // Locate the actual scrollable element.
+    function findScroller(list) {
+        const scrollCandidates = [list];
+
+        if (list.shadowRoot) {
+            scrollCandidates.push(
+                ...deepQueryAll("*", list.shadowRoot)
+            );
+        }
+
+        scrollCandidates.push(...deepQueryAll("*", list));
+
+        return scrollCandidates
+            .filter(el => {
+                try {
+                    return el.scrollHeight > el.clientHeight + 30;
+                } catch {
+                    return false;
+                }
+            })
+            .sort(
+                (a, b) =>
+                    (b.scrollHeight - b.clientHeight) -
+                    (a.scrollHeight - a.clientHeight)
+            )[0] || null;
+    }
+
+    // Until there are enough captions to scroll, there's no scroller yet.
+    let scroller = findScroller(list);
+
+    console.log("Found caption scroller:", scroller);
+
+    // Captions currently rendered, in on-screen order.
+    function renderedCaptions() {
+        const seen = new Set();
+        const texts = [];
+
+        for (const box of deepQueryAll(BOX_SELECTOR, list)) {
+            const text = getText(box);
+            const id = box.getAttribute("data-test") || text;
+
+            if (text && !seen.has(id)) {
+                seen.add(id);
+                texts.push(text);
+            }
+        }
+
+        return texts;
+    }
+
+    /*
+     * Scroll through the panel to read captions Webex isn't rendering.
+     * Only scrolls back until the last few saved captions show up;
+     * everything before that is already in the saved transcript.
+     */
+    async function scrollCapture() {
+        scroller = findScroller(list);
+
+        if (!scroller) return renderedCaptions();
+
+        const captions = new Map();
+
+        function scan() {
+            for (const box of deepQueryAll(BOX_SELECTOR, list)) {
+                const text = getText(box);
+                const id = box.getAttribute("data-test") || text;
+
+                if (text) {
+                    captions.set(id, text);
+                }
+            }
+
+            console.log(`Captured ${captions.size} caption entries...`);
+        }
+
+        const anchor = session.captions
+            .filter(t => t !== GAP_MARKER)
+            .slice(-3)
+            .map(norm);
+
+        function reachedSaved() {
+            if (!anchor.length) return false;
+
+            const texts = [...captions.values()].map(norm);
+            return anchor.every(a => texts.some(t => sameCaption(a, t)));
+        }
+
+        // Start from the newest captions, even if the panel was scrolled up.
+        scroller.scrollTop = scroller.scrollHeight;
+        await sleep(250);
+
+        // Grab whatever is currently rendered.
+        scan();
+
+        /*
+         * Webex virtualizes the caption list, so old captions don't all
+         * exist in the DOM simultaneously. Scroll upward incrementally so
+         * Webex renders each older section and we can capture it.
+         */
+        console.log("Scanning backward through caption history...");
+
+        let previousTop = -1;
+        let stuckCount = 0;
+        let caughtUp = reachedSaved();
+
+        while (!caughtUp && scroller.scrollTop > 0 && stuckCount < 10) {
+            scan();
+
+            if (reachedSaved()) {
+                caughtUp = true;
+                break;
+            }
+
+            const before = scroller.scrollTop;
+
+            scroller.scrollTop = Math.max(
+                0,
+                scroller.scrollTop - Math.max(200, scroller.clientHeight * 0.7)
+            );
+
+            await sleep(250);
+
+            if (scroller.scrollTop === before || scroller.scrollTop === previousTop) {
+                stuckCount++;
+            } else {
+                stuckCount = 0;
+            }
+
+            previousTop = scroller.scrollTop;
+        }
+
+        if (caughtUp) {
+            console.log("Reached captions saved by an earlier run.");
+        } else {
+            scroller.scrollTop = 0;
+            await sleep(750);
+            scan();
+
+            console.log(
+                `Reached oldest available caption. ${captions.size} entries captured.`
+            );
+        }
+
+        /*
+         * Walk forward from where the backward pass stopped. Besides ensuring
+         * every virtualized caption is visited, this gives us chronological
+         * order, and it leaves the panel at the bottom so new captions render.
+         */
+        const ordered = [];
+        const seen = new Set();
+
+        function scanOrdered() {
+            for (const box of deepQueryAll(BOX_SELECTOR, list)) {
+                const text = getText(box);
+                const id = box.getAttribute("data-test") || text;
+
+                if (text && !seen.has(id)) {
+                    seen.add(id);
+                    ordered.push(text);
+                }
+            }
+        }
+
+        console.log("Scanning forward and assembling transcript...");
+
+        let safety = 0;
+
+        while (safety++ < 5000) {
+            scan();
+            scanOrdered();
+
+            const maxScroll =
+                scroller.scrollHeight - scroller.clientHeight;
+
+            if (scroller.scrollTop >= maxScroll - 5) {
+                break;
+            }
+
+            const before = scroller.scrollTop;
+
+            scroller.scrollTop = Math.min(
+                maxScroll,
+                scroller.scrollTop + Math.max(200, scroller.clientHeight * 0.7)
+            );
+
+            await sleep(250);
+
+            if (scroller.scrollTop === before) {
+                await sleep(500);
+
+                if (scroller.scrollTop === before) {
+                    break;
+                }
+            }
+        }
+
+        await sleep(750);
+        scan();
+        scanOrdered();
+
+        // Fall back to everything captured if chronological pass missed anything.
+        for (const [id, text] of captions) {
+            if (!seen.has(id)) {
+                seen.add(id);
+                ordered.push(text);
+            }
+        }
+
+        return ordered;
+    }
+
+    /*
+     * Merge captions into the saved transcript by finding the connecting
+     * point: try every way the two lists could line up and keep the
+     * alignment where the most overlapping captions match.
+     *
+     * With live: true, `current` must line up inside or after `saved`
+     * (no gap, nothing older than `saved`); returns null if it doesn't.
+     */
+    function merge(saved, current, { live = false } = {}) {
+        const ns = saved.map(norm);
+        const nc = current.map(norm);
+        let best = null;
+
+        // offset: current[i] lines up with saved[offset + i].
+        for (let offset = live ? 0 : 1 - nc.length; offset < ns.length; offset++) {
+            const from = Math.max(0, -offset);
+            const to = Math.min(nc.length, ns.length - offset);
+            let matches = 0;
+
+            for (let i = from; i < to; i++) {
+                if (sameCaption(ns[offset + i], nc[i])) matches++;
+            }
+
+            if (
+                matches &&
+                matches >= 0.6 * (to - from) &&
+                (!best || matches > best.matches)
+            ) {
+                best = { offset, matches };
+            }
+        }
+
+        if (!best) {
+            if (live) return null;
+
+            return saved.length
+                ? [...saved, GAP_MARKER, ...current]
+                : [...current];
+        }
+
+        const { offset } = best;
+        const merged = [];
+        const start = Math.min(0, offset);
+        const end = Math.max(saved.length, offset + current.length);
+
+        for (let p = start; p < end; p++) {
+            const s = saved[p];
+            const c = current[p - offset];
+
+            if (s === undefined) {
+                merged.push(c);
+            } else if (c === undefined) {
+                merged.push(s);
+            } else {
+                // Prefer the newer copy unless the saved one is the longer
+                // version of the same caption.
+                const ss = norm(s);
+                const cc = norm(c);
+                merged.push(
+                    sameCaption(ss, cc) && ss.length > cc.length ? s : c
+                );
+            }
+        }
+
+        return merged;
+    }
+
+    // Bumped whenever the saved transcript changes.
+    let version = 0;
+    let downloadedVersion = 0;
+
+    function update(merged) {
+        if (merged.join("\n\n") === session.captions.join("\n\n")) return 0;
+
+        const added = realCount(merged) - realCount(session.captions);
+
+        session.captions = merged;
+        session.updated = Date.now();
+        version++;
+
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(session));
+        } catch (err) {
+            console.warn("Could not save the transcript to localStorage.", err);
+        }
+
+        return added;
+    }
+
+    // Live check: only the newest saved captions can connect to what's on
+    // screen; if they don't, catch up by scrolling on the next full sync.
+    const LIVE_TAIL = 200;
+
+    function liveSync() {
+        const current = renderedCaptions();
+
+        if (!current.length) return true;
+
+        const head = session.captions.slice(0, -LIVE_TAIL);
+        const tail = session.captions.slice(-LIVE_TAIL);
+        const merged = merge(tail, current, { live: true });
+
+        if (!merged) return false;
+
+        const added = update([...head, ...merged]);
+
+        if (added > 0) {
+            console.log(
+                `+${added} caption entries ` +
+                `(${realCount(session.captions)} total)`
+            );
+        }
+
+        return true;
+    }
+
+    async function fullSync() {
+        const added = update(merge(session.captions, await scrollCapture()));
+
+        console.log(
+            `Synced: ${realCount(session.captions)} caption entries ` +
+            `(${added} new).`
+        );
+    }
+
+    function downloadLatest(reason) {
+        if (version === downloadedVersion || !session.captions.length) {
+            return;
+        }
+
+        const filename = filenameNow();
+
+        download(session.captions, filename);
+        downloadedVersion = version;
+
+        console.log(
+            `Downloaded "${filename}" (${realCount(session.captions)} caption ` +
+            `entries, ${reason}). It includes everything from earlier ` +
+            `downloads, so older files can be deleted.`
+        );
+    }
+
+    // First pass: catch up on everything Webex still has, then download.
+    await fullSync();
+    version++; // Always download once on start.
+    downloadLatest("start");
+
+    let busy = false;
+    let needsFullSync = false;
+    let lastFullSync = Date.now();
+    let panelGone = false;
+
+    const atBottom = () =>
+        !scroller ||
+        scroller.scrollTop >= scroller.scrollHeight - scroller.clientHeight - 5;
+
+    async function check() {
+        if (busy) return;
+        busy = true;
+
+        try {
+            if (!list.isConnected) {
+                const found = deepFind(CAPTIONS_SELECTOR);
+
+                if (!found) {
+                    // Meeting ended, or the captions panel was closed. Every
+                    // caption is already saved; download it right away.
+                    if (!panelGone) {
+                        panelGone = true;
+                        console.log(
+                            "Captions panel disappeared (meeting ended or " +
+                            "panel closed). Downloading the latest transcript; " +
+                            "still watching in case it comes back."
+                        );
+                        downloadLatest("captions panel closed");
+                    }
+                    return;
+                }
+
+                console.log("Captions panel is back; catching up.");
+                list = found;
+                scroller = findScroller(list);
+                panelGone = false;
+                needsFullSync = true;
+            }
+
+            scroller ??= findScroller(list);
+
+            if (!liveSync() || !atBottom()) {
+                needsFullSync = true;
+            }
+
+            if (needsFullSync && Date.now() - lastFullSync >= FULL_SYNC_EVERY_MS) {
+                await fullSync();
+                needsFullSync = false;
+                lastFullSync = Date.now();
+            }
+        } catch (err) {
+            console.warn("Caption check failed; will retry.", err);
+        } finally {
+            busy = false;
+        }
+    }
+
+    // Grab what's saved if the meeting frame starts to unload, and ask
+    // before leaving so the final captions aren't lost.
+    function onBeforeUnload(event) {
+        liveSync();
+        downloadLatest("page closing");
+        event.preventDefault();
+        event.returnValue = "";
+    }
+
+    const checkTimer = setInterval(check, CHECK_EVERY_MS);
+    const downloadTimer = setInterval(
+        () => downloadLatest("scheduled"),
+        DOWNLOAD_EVERY_MS
+    );
+
+    window.addEventListener("beforeunload", onBeforeUnload);
+
+    window.webexCaptionCapper = {
+        stop({ download = true } = {}) {
+            clearInterval(checkTimer);
+            clearInterval(downloadTimer);
+            window.removeEventListener("beforeunload", onBeforeUnload);
+
+            if (download) downloadLatest("stopped");
+
+            delete window.webexCaptionCapper;
+            console.log("Webex caption capper stopped.");
+        },
+
+        download() {
+            version++; // Force a download even if nothing changed.
+            downloadLatest("requested");
+        }
+    };
+
+    console.log(
+        `Watching for new captions every ${CHECK_EVERY_MS / 1000}s and ` +
+        `downloading the latest transcript every ` +
+        `${DOWNLOAD_EVERY_MS / 60000} min when it has changed.\n` +
+        "Download now:  webexCaptionCapper.download()\n" +
+        "Stop:          webexCaptionCapper.stop()\n" +
+        "Start this meeting's transcript over:  " +
+        `localStorage.removeItem(${JSON.stringify(STORAGE_KEY)})`
+    );
+})();
